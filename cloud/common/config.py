@@ -12,6 +12,8 @@ def _int(name: str, default: int) -> int:
 class GatewaySettings:
     db_path: str = os.getenv("GATEWAY_DB_PATH", "gateway.db")
     haystack_base_url: str = os.getenv("HAYSTACK_BASE_URL", "http://127.0.0.1:8002")
+    gateway_base_url: str = os.getenv("GATEWAY_BASE_URL", "http://127.0.0.1:8000")
+    volumes_dir: str = os.getenv("HAYSTACK_VOLUMES_DIR", "volumes")
 
 
 @dataclass(slots=True)

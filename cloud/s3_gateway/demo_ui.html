@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Haystack Demo UI</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; max-width: 1000px; }
+    h1 { margin-bottom: 8px; }
+    .muted { color: #555; margin-top: 0; }
+    section { border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin: 12px 0; }
+    label { display: block; margin: 8px 0 4px; }
+    input, button { padding: 6px; }
+    button { cursor: pointer; margin-top: 8px; }
+    pre { background: #111; color: #eee; padding: 10px; border-radius: 6px; overflow: auto; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  </style>
+</head>
+<body>
+  <h1>Haystack Event-Driven Demo UI</h1>
+  <p class="muted">Jednostránkové demo pro upload, stav objektu, download, soft delete, health a compaction.</p>
+
+  <section>
+    <h2>Upload</h2>
+    <label for="file">Soubor</label>
+    <input id="file" type="file" />
+    <label for="bucket">Bucket</label>
+    <input id="bucket" type="text" value="default" />
+    <label for="owner">Owner</label>
+    <input id="owner" type="text" value="anonymous" />
+    <div><button id="uploadBtn">Upload</button></div>
+  </section>
+
+  <section>
+    <h2>Objekt (stav / download / soft delete)</h2>
+    <label for="objectId">Object ID</label>
+    <input id="objectId" type="text" style="width: 100%;" />
+    <div class="row">
+      <button id="statusBtn">Kontrola stavu</button>
+      <button id="downloadBtn">Download</button>
+      <button id="deleteBtn">Soft Delete</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Systémový stav</h2>
+    <button id="healthBtn">Načíst health (gateway/broker/haystack)</button>
+  </section>
+
+  <section>
+    <h2>Compaction demo</h2>
+    <label for="volumeId">Volume ID</label>
+    <input id="volumeId" type="number" min="1" value="1" />
+    <div><button id="compactBtn">Spustit compaction</button></div>
+  </section>
+
+  <section>
+    <h2>Výstup</h2>
+    <pre id="out">{}</pre>
+  </section>
+
+  <script>
+    const out = document.getElementById("out");
+    const objectIdInput = document.getElementById("objectId");
+
+    function print(title, payload) {
+      out.textContent = JSON.stringify({ title, ...payload }, null, 2);
+    }
+
+    async function parseResponse(resp) {
+      const contentType = resp.headers.get("content-type") || "";
+      let body = null;
+      if (contentType.includes("application/json")) {
+        body = await resp.json();
+      } else {
+        body = await resp.text();
+      }
+      return { status_code: resp.status, body };
+    }
+
+    document.getElementById("uploadBtn").onclick = async () => {
+      const fileInput = document.getElementById("file");
+      if (!fileInput.files.length) {
+        print("upload", { error: "Vyber soubor." });
+        return;
+      }
+      const bucket = document.getElementById("bucket").value || "default";
+      const owner = document.getElementById("owner").value || "anonymous";
+      const fd = new FormData();
+      fd.append("file", fileInput.files[0]);
+      const resp = await fetch(`/upload?bucket=${encodeURIComponent(bucket)}&owner=${encodeURIComponent(owner)}`, {
+        method: "POST",
+        body: fd,
+      });
+      const parsed = await parseResponse(resp);
+      if (parsed.body && parsed.body.object_id) {
+        objectIdInput.value = parsed.body.object_id;
+      }
+      print("upload", parsed);
+    };
+
+    document.getElementById("statusBtn").onclick = async () => {
+      const objectId = objectIdInput.value.trim();
+      if (!objectId) {
+        print("status", { error: "Zadej object_id." });
+        return;
+      }
+      const resp = await fetch(`/objects/${encodeURIComponent(objectId)}`);
+      print("status", await parseResponse(resp));
+    };
+
+    document.getElementById("downloadBtn").onclick = async () => {
+      const objectId = objectIdInput.value.trim();
+      if (!objectId) {
+        print("download", { error: "Zadej object_id." });
+        return;
+      }
+      const resp = await fetch(`/download/${encodeURIComponent(objectId)}`);
+      if (resp.status === 200) {
+        const blob = await resp.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        print("download", {
+          status_code: 200,
+          size: blob.size,
+          content_type: resp.headers.get("content-type"),
+          open_url: objectUrl
+        });
+      } else {
+        print("download", await parseResponse(resp));
+      }
+    };
+
+    document.getElementById("deleteBtn").onclick = async () => {
+      const objectId = objectIdInput.value.trim();
+      if (!objectId) {
+        print("soft_delete", { error: "Zadej object_id." });
+        return;
+      }
+      const resp = await fetch(`/download/${encodeURIComponent(objectId)}`, { method: "DELETE" });
+      print("soft_delete", await parseResponse(resp));
+    };
+
+    document.getElementById("healthBtn").onclick = async () => {
+      const resp = await fetch("/admin/system-health");
+      print("system_health", await parseResponse(resp));
+    };
+
+    document.getElementById("compactBtn").onclick = async () => {
+      const volumeId = document.getElementById("volumeId").value || "1";
+      const resp = await fetch(`/admin/volumes/${encodeURIComponent(volumeId)}/compact`, { method: "POST" });
+      print("compaction", await parseResponse(resp));
+    };
+  </script>
+</body>
+</html>

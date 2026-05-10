@@ -130,3 +130,103 @@ async def test_upload_ack_download_and_soft_delete_flow(tmp_path: Path) -> None:
 
                 missing_after_delete = await gateway_client.get(f"/download/{object_id}")
                 assert missing_after_delete.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_object_info_and_system_health_endpoints(tmp_path: Path) -> None:
+    broker = InMemoryBroker()
+    haystack_app = create_haystack_app(
+        settings=HaystackSettings(
+            volumes_dir=str(tmp_path / "volumes"),
+            max_volume_size_bytes=1024,
+        ),
+        broker=broker,
+    )
+
+    async def fetch_from_haystack(volume_id: int, offset: int, size: int) -> bytes:
+        return haystack_app.state.manager.read(volume_id, offset, size)
+
+    async def fake_system_health():
+        return {
+            "gateway": {"status": "ok", "http_status": 200, "error": None},
+            "broker": {"status": "ok", "http_status": 200, "error": None},
+            "haystack": {"status": "down", "http_status": 503, "error": "unreachable"},
+        }
+
+    gateway_app = create_gateway_app(
+        settings=GatewaySettings(
+            db_path=str(tmp_path / "gateway.db"),
+            haystack_base_url="http://unused",
+        ),
+        broker=broker,
+        haystack_fetcher=fetch_from_haystack,
+        system_health_checker=fake_system_health,
+    )
+    transport = httpx.ASGITransport(app=gateway_app)
+
+    async with haystack_app.router.lifespan_context(haystack_app):
+        async with gateway_app.router.lifespan_context(gateway_app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+                upload = await client.post(
+                    "/upload?bucket=test&owner=alice",
+                    files={"file": ("avatar.jpg", b"abc123", "image/jpeg")},
+                )
+                assert upload.status_code == 202
+                object_id = upload.json()["object_id"]
+
+                for _ in range(_MAX_ACK_RETRIES):
+                    row = gateway_app.state.db.get_object(object_id)
+                    if row and row["status"] == "ready":
+                        break
+                    await asyncio.sleep(_ACK_RETRY_DELAY_SECONDS)
+
+                object_info = await client.get(f"/objects/{object_id}")
+                assert object_info.status_code == 200
+                info = object_info.json()
+                assert info["object_id"] == object_id
+                assert info["status"] == "ready"
+                assert info["is_deleted"] is False
+                assert info["volume_id"] == 1
+                assert info["offset"] == 0
+                assert info["size"] == 6
+
+                health = await client.get("/admin/system-health")
+                assert health.status_code == 200
+                payload = health.json()
+                assert payload["gateway"]["status"] == "ok"
+                assert payload["broker"]["status"] == "ok"
+                assert payload["haystack"]["status"] == "down"
+
+
+@pytest.mark.asyncio
+async def test_compact_endpoint_calls_compactor(tmp_path: Path) -> None:
+    broker = InMemoryBroker()
+    called: dict[str, object] = {}
+
+    def fake_compactor(gateway_base_url: str, volumes_dir: str, volume_id: int) -> None:
+        called["gateway_base_url"] = gateway_base_url
+        called["volumes_dir"] = volumes_dir
+        called["volume_id"] = volume_id
+
+    gateway_app = create_gateway_app(
+        settings=GatewaySettings(
+            db_path=str(tmp_path / "gateway.db"),
+            gateway_base_url="http://gateway:8000",
+            volumes_dir=str(tmp_path / "volumes"),
+        ),
+        broker=broker,
+        compactor=fake_compactor,
+    )
+    transport = httpx.ASGITransport(app=gateway_app)
+
+    async with gateway_app.router.lifespan_context(gateway_app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+            response = await client.post("/admin/volumes/3/compact")
+            assert response.status_code == 200
+            assert response.json() == {"volume_id": 3, "status": "done"}
+
+    assert called == {
+        "gateway_base_url": "http://gateway:8000",
+        "volumes_dir": str(tmp_path / "volumes"),
+        "volume_id": 3,
+    }
