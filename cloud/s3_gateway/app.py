@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from contextlib import suppress
 from datetime import datetime, timezone
 import os
@@ -178,16 +179,15 @@ def create_app(
     broker: BrokerClient | None = None,
     haystack_fetcher: Callable[[int, int, int], Awaitable[bytes]] | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="S3 Gateway")
     cfg = settings or GatewaySettings()
     db = GatewayDB(cfg.db_path)
-    app.state.db = db
-    app.state.broker = broker
-    app.state.ack_task = None
-    app.state.haystack_fetcher = haystack_fetcher or _default_haystack_fetcher(cfg.haystack_base_url)
 
-    @app.on_event("startup")
-    async def startup() -> None:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.db = db
+        app.state.broker = broker
+        app.state.ack_task = None
+        app.state.haystack_fetcher = haystack_fetcher or _default_haystack_fetcher(cfg.haystack_base_url)
         if app.state.broker is None:
             broker_cfg = HttpBrokerSettings()
             app.state.broker = HttpBrokerClient(
@@ -196,15 +196,17 @@ def create_app(
                 poll_timeout_seconds=broker_cfg.poll_timeout_seconds,
             )
         app.state.ack_task = asyncio.create_task(_consume_storage_ack(app), name="storage-ack-consumer")
+        try:
+            yield
+        finally:
+            task = app.state.ack_task
+            if task:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            db.close()
 
-    @app.on_event("shutdown")
-    async def shutdown() -> None:
-        task = app.state.ack_task
-        if task:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-        db.close()
+    app = FastAPI(title="S3 Gateway", lifespan=lifespan)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,7 +65,8 @@ class VolumeManager:
             raise ValueError("payload cannot be empty")
 
         async with self._lock:
-            assert self._active_file is not None
+            if self._active_file is None:
+                raise RuntimeError("Active volume file is not initialized")
             self._active_file.seek(0, 2)
             current_size = self._active_file.tell()
             if current_size + len(payload) > self._max_volume_size_bytes:
@@ -105,15 +107,14 @@ def create_app(
     settings: HaystackSettings | None = None,
     broker: BrokerClient | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Haystack Node")
     cfg = settings or HaystackSettings()
     manager = VolumeManager(cfg.volumes_dir, cfg.max_volume_size_bytes)
-    app.state.manager = manager
-    app.state.broker = broker
-    app.state.consumer_task = None
 
-    @app.on_event("startup")
-    async def startup() -> None:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.manager = manager
+        app.state.broker = broker
+        app.state.consumer_task = None
         manager.start()
         if app.state.broker is None:
             broker_cfg = HttpBrokerSettings()
@@ -123,15 +124,17 @@ def create_app(
                 poll_timeout_seconds=broker_cfg.poll_timeout_seconds,
             )
         app.state.consumer_task = asyncio.create_task(_consume_storage_write(app), name="storage-write-consumer")
+        try:
+            yield
+        finally:
+            task = app.state.consumer_task
+            if task:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            manager.close()
 
-    @app.on_event("shutdown")
-    async def shutdown() -> None:
-        task = app.state.consumer_task
-        if task:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-        manager.close()
+    app = FastAPI(title="Haystack Node", lifespan=lifespan)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
