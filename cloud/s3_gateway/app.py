@@ -21,7 +21,7 @@ from cloud.common.contracts import (
     encode_storage_write,
 )
 
-ERROR_RETRY_DELAY_SECONDS = 1.0
+_ERROR_RETRY_DELAY_SECONDS = 1.0
 
 
 def _utcnow() -> str:
@@ -292,7 +292,7 @@ async def _consume_storage_ack(app: FastAPI) -> None:
         except asyncio.CancelledError:
             raise
         except Exception:
-            await asyncio.sleep(ERROR_RETRY_DELAY_SECONDS)
+            await asyncio.sleep(_ERROR_RETRY_DELAY_SECONDS)
 
 
 app = create_app()

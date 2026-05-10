@@ -19,7 +19,7 @@ from cloud.common.contracts import (
 
 
 _VOLUME_RE = re.compile(r"^volume_(\d+)\.dat$")
-ERROR_RETRY_DELAY_SECONDS = 1.0
+_ERROR_RETRY_DELAY_SECONDS = 1.0
 
 
 @dataclass(slots=True)
@@ -172,7 +172,7 @@ async def _consume_storage_write(app: FastAPI) -> None:
         except asyncio.CancelledError:
             raise
         except Exception:
-            await asyncio.sleep(ERROR_RETRY_DELAY_SECONDS)
+            await asyncio.sleep(_ERROR_RETRY_DELAY_SECONDS)
 
 
 app = create_app()

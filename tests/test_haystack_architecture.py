@@ -94,38 +94,36 @@ async def test_upload_ack_download_and_soft_delete_flow(tmp_path: Path) -> None:
         haystack_fetcher=fetch_from_haystack,
     )
 
-    haystack_transport = httpx.ASGITransport(app=haystack_app)
     gateway_transport = httpx.ASGITransport(app=gateway_app)
 
     async with haystack_app.router.lifespan_context(haystack_app):
         async with gateway_app.router.lifespan_context(gateway_app):
-            async with httpx.AsyncClient(transport=haystack_transport, base_url="http://haystack"):
-                async with httpx.AsyncClient(transport=gateway_transport, base_url="http://gateway") as gateway_client:
-                    upload = await gateway_client.post(
-                        "/upload?bucket=test&owner=alice",
-                        files={"file": ("avatar.jpg", b"abc123", "image/jpeg")},
-                    )
-                    assert upload.status_code == 202
-                    object_id = upload.json()["object_id"]
+            async with httpx.AsyncClient(transport=gateway_transport, base_url="http://gateway") as gateway_client:
+                upload = await gateway_client.post(
+                    "/upload?bucket=test&owner=alice",
+                    files={"file": ("avatar.jpg", b"abc123", "image/jpeg")},
+                )
+                assert upload.status_code == 202
+                object_id = upload.json()["object_id"]
 
-                    for _ in range(20):
-                        row = gateway_app.state.db.get_object(object_id)
-                        if row and row["status"] == "ready":
-                            break
-                        await asyncio.sleep(0.05)
-
+                for _ in range(20):
                     row = gateway_app.state.db.get_object(object_id)
-                    assert row is not None
-                    assert row["status"] == "ready"
-                    assert row["is_deleted"] == 0
+                    if row and row["status"] == "ready":
+                        break
+                    await asyncio.sleep(0.05)
 
-                    download = await gateway_client.get(f"/download/{object_id}")
-                    assert download.status_code == 200
-                    assert download.content == b"abc123"
-                    assert download.headers["content-type"].startswith("image/jpeg")
+                row = gateway_app.state.db.get_object(object_id)
+                assert row is not None
+                assert row["status"] == "ready"
+                assert row["is_deleted"] == 0
 
-                    delete_response = await gateway_client.delete(f"/download/{object_id}")
-                    assert delete_response.status_code == 204
+                download = await gateway_client.get(f"/download/{object_id}")
+                assert download.status_code == 200
+                assert download.content == b"abc123"
+                assert download.headers["content-type"].startswith("image/jpeg")
 
-                    missing_after_delete = await gateway_client.get(f"/download/{object_id}")
-                    assert missing_after_delete.status_code == 404
+                delete_response = await gateway_client.delete(f"/download/{object_id}")
+                assert delete_response.status_code == 204
+
+                missing_after_delete = await gateway_client.get(f"/download/{object_id}")
+                assert missing_after_delete.status_code == 404
