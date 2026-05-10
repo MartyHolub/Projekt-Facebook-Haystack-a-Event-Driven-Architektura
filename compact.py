@@ -18,14 +18,14 @@ def compact_volume(*, gateway_base_url: str, volumes_dir: str, volume_id: int) -
     lock_file = volumes_path / f"volume_{volume_id}.compact.lock"
     lock_fd = None
     backup = volumes_path / f"volume_{volume_id}.bak"
-    old_target = target if target.exists() else None
-    if old_target:
-        old_target.unlink()
 
     try:
         lock_fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_RDWR)
     except FileExistsError as exc:
         raise RuntimeError(f"Compaction for volume {volume_id} is already in progress") from exc
+
+    if target.exists():
+        target.unlink()
 
     response = httpx.get(f"{gateway_base_url}/admin/volumes/{volume_id}/live-objects", timeout=30)
     response.raise_for_status()

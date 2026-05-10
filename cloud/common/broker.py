@@ -9,6 +9,8 @@ from uuid import uuid4
 
 import httpx
 
+TIMEOUT_BUFFER_SECONDS = 5.0
+
 
 class BrokerClient(abc.ABC):
     @abc.abstractmethod
@@ -69,7 +71,7 @@ class HttpBrokerClient(BrokerClient):
             response.raise_for_status()
 
     async def stream(self, topic: str) -> AsyncIterator[bytes]:
-        async with httpx.AsyncClient(timeout=self.poll_timeout_seconds + 5) as client:
+        async with httpx.AsyncClient(timeout=self.poll_timeout_seconds + TIMEOUT_BUFFER_SECONDS) as client:
             subscribe = await client.post(f"{self.base_url}/topics/{topic}/subscribe")
             subscribe.raise_for_status()
             consumer_id = subscribe.json()["consumer_id"]
