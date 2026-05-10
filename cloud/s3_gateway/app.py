@@ -4,14 +4,20 @@ import asyncio
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from datetime import datetime, timezone
+import logging
 import os
+from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import threading
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, Query, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from cloud.common.broker import BrokerClient, HttpBrokerClient
@@ -23,6 +29,9 @@ from cloud.common.contracts import (
 )
 
 _ERROR_RETRY_DELAY_SECONDS = 1.0
+_UI_PATH = Path(__file__).with_name("demo_ui.html")
+_UI_HTML = _UI_PATH.read_text(encoding="utf-8")
+_LOGGER = logging.getLogger(__name__)
 
 
 def _utcnow() -> str:
@@ -179,6 +188,38 @@ class LocationPatch(BaseModel):
     size: int
 
 
+class ObjectInfo(BaseModel):
+    object_id: str
+    bucket: str
+    owner: str
+    status: str
+    volume_id: int | None
+    offset: int | None
+    size: int | None
+    content_type: str | None
+    is_deleted: bool
+    billed: bool
+    created_at: str
+    updated_at: str
+
+
+class CompactResult(BaseModel):
+    volume_id: int
+    status: str
+
+
+class ServiceHealth(BaseModel):
+    status: str
+    http_status: int | None = None
+    error: str | None = None
+
+
+class SystemHealth(BaseModel):
+    gateway: ServiceHealth
+    broker: ServiceHealth
+    haystack: ServiceHealth
+
+
 def _default_haystack_fetcher(base_url: str) -> Callable[[int, int, int], Awaitable[bytes]]:
     async def fetch(volume_id: int, offset: int, size: int) -> bytes:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -192,11 +233,91 @@ def _default_haystack_fetcher(base_url: str) -> Callable[[int, int, int], Awaita
     return fetch
 
 
+def _row_to_object_info(row: sqlite3.Row) -> ObjectInfo:
+    return ObjectInfo(
+        object_id=row["object_id"],
+        bucket=row["bucket"],
+        owner=row["owner"],
+        status=row["status"],
+        volume_id=row["volume_id"],
+        offset=row["offset"],
+        size=row["size"],
+        content_type=row["content_type"],
+        is_deleted=bool(row["is_deleted"]),
+        billed=bool(row["billed"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _default_compactor(gateway_base_url: str, volumes_dir: str, volume_id: int) -> None:
+    script = Path(__file__).resolve().parents[2] / "compact.py"
+    subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            str(volume_id),
+            "--gateway-base-url",
+            gateway_base_url,
+            "--volumes-dir",
+            volumes_dir,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _service_ok(http_status: int) -> ServiceHealth:
+    return ServiceHealth(status="ok", http_status=http_status)
+
+
+def _service_down(http_status: int | None = None, error: str | None = None) -> ServiceHealth:
+    return ServiceHealth(status="down", http_status=http_status, error=error)
+
+
+def _default_system_health_checker(
+    *,
+    broker_base_url: str,
+    haystack_base_url: str,
+) -> Callable[[], Awaitable[SystemHealth]]:
+    async def checker() -> SystemHealth:
+        async with httpx.AsyncClient(timeout=5) as client:
+            broker = _service_down(error="unreachable")
+            haystack = _service_down(error="unreachable")
+
+            try:
+                broker_resp = await client.get(f"{broker_base_url}/health")
+                broker = _service_ok(broker_resp.status_code) if broker_resp.status_code == 200 else _service_down(
+                    http_status=broker_resp.status_code
+                )
+            except Exception as exc:
+                broker = _service_down(error=str(exc))
+
+            try:
+                haystack_resp = await client.get(f"{haystack_base_url}/health")
+                haystack = _service_ok(haystack_resp.status_code) if haystack_resp.status_code == 200 else _service_down(
+                    http_status=haystack_resp.status_code
+                )
+            except Exception as exc:
+                haystack = _service_down(error=str(exc))
+
+        return SystemHealth(
+            gateway=_service_ok(200),
+            broker=broker,
+            haystack=haystack,
+        )
+
+    return checker
+
+
 def create_app(
     *,
     settings: GatewaySettings | None = None,
     broker: BrokerClient | None = None,
     haystack_fetcher: Callable[[int, int, int], Awaitable[bytes]] | None = None,
+    compactor: Callable[[str, str, int], None] | None = None,
+    system_health_checker: Callable[[], Awaitable[SystemHealth]] | None = None,
 ) -> FastAPI:
     cfg = settings or GatewaySettings()
     db = GatewayDB(cfg.db_path)
@@ -207,13 +328,18 @@ def create_app(
         app.state.broker = broker
         app.state.ack_task = None
         app.state.haystack_fetcher = haystack_fetcher or _default_haystack_fetcher(cfg.haystack_base_url)
+        app.state.compactor = compactor or _default_compactor
         if app.state.broker is None:
-            broker_cfg = HttpBrokerSettings()
+            broker_cfg = HttpBrokerSettings(base_url=cfg.broker_base_url)
             app.state.broker = HttpBrokerClient(
                 base_url=broker_cfg.base_url,
                 timeout_seconds=broker_cfg.timeout_seconds,
                 poll_timeout_seconds=broker_cfg.poll_timeout_seconds,
             )
+        app.state.system_health_checker = system_health_checker or _default_system_health_checker(
+            broker_base_url=cfg.broker_base_url,
+            haystack_base_url=cfg.haystack_base_url,
+        )
         app.state.ack_task = asyncio.create_task(_consume_storage_ack(app), name="storage-ack-consumer")
         try:
             yield
@@ -230,6 +356,22 @@ def create_app(
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/", response_class=HTMLResponse)
+    async def demo_ui() -> HTMLResponse:
+        return HTMLResponse(content=_UI_HTML)
+
+    @app.get("/objects/{object_id}", response_model=ObjectInfo)
+    async def object_info(object_id: str) -> ObjectInfo:
+        row = db.get_object(object_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Object not found")
+        return _row_to_object_info(row)
+
+    @app.get("/admin/system-health", response_model=SystemHealth)
+    async def system_health() -> SystemHealth:
+        checker: Callable[[], Awaitable[SystemHealth]] = app.state.system_health_checker
+        return await checker()
 
     @app.post("/upload", response_model=UploadAccepted, status_code=202)
     async def upload(
@@ -289,6 +431,32 @@ def create_app(
         )
         if not updated:
             raise HTTPException(status_code=404, detail="Object not found")
+
+    @app.post("/admin/volumes/{volume_id}/compact", response_model=CompactResult)
+    async def compact(volume_id: int) -> CompactResult:
+        compactor_fn: Callable[[str, str, int], None] = app.state.compactor
+        volumes_dir = cfg.volumes_dir.strip()
+        if not volumes_dir:
+            raise HTTPException(status_code=500, detail="HAYSTACK_VOLUMES_DIR is not configured")
+        try:
+            await run_in_threadpool(compactor_fn, cfg.gateway_base_url, volumes_dir, volume_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except httpx.HTTPStatusError as exc:
+            _LOGGER.exception("Compaction failed due to gateway API error")
+            raise HTTPException(
+                status_code=502,
+                detail="Compaction failed while updating object metadata via gateway admin API",
+            )
+        except subprocess.CalledProcessError as exc:
+            _LOGGER.exception("Compaction subprocess execution failed")
+            raise HTTPException(status_code=502, detail="Compaction script execution failed")
+        except Exception as exc:
+            _LOGGER.exception("Unexpected compaction failure")
+            raise HTTPException(status_code=500, detail=f"Compaction failed ({type(exc).__name__})")
+        return CompactResult(volume_id=volume_id, status="done")
 
     return app
 
