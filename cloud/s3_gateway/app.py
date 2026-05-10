@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from datetime import datetime, timezone
+import logging
 import os
 from pathlib import Path
 import sqlite3
@@ -30,6 +31,7 @@ from cloud.common.contracts import (
 _ERROR_RETRY_DELAY_SECONDS = 1.0
 _UI_PATH = Path(__file__).with_name("demo_ui.html")
 _UI_HTML = _UI_PATH.read_text(encoding="utf-8")
+_LOGGER = logging.getLogger(__name__)
 
 
 def _utcnow() -> str:
@@ -328,16 +330,14 @@ def create_app(
         app.state.haystack_fetcher = haystack_fetcher or _default_haystack_fetcher(cfg.haystack_base_url)
         app.state.compactor = compactor or _default_compactor
         if app.state.broker is None:
-            broker_cfg = HttpBrokerSettings()
+            broker_cfg = HttpBrokerSettings(base_url=cfg.broker_base_url)
             app.state.broker = HttpBrokerClient(
                 base_url=broker_cfg.base_url,
                 timeout_seconds=broker_cfg.timeout_seconds,
                 poll_timeout_seconds=broker_cfg.poll_timeout_seconds,
             )
-        else:
-            broker_cfg = HttpBrokerSettings()
         app.state.system_health_checker = system_health_checker or _default_system_health_checker(
-            broker_base_url=broker_cfg.base_url,
+            broker_base_url=cfg.broker_base_url,
             haystack_base_url=cfg.haystack_base_url,
         )
         app.state.ack_task = asyncio.create_task(_consume_storage_ack(app), name="storage-ack-consumer")
@@ -435,19 +435,27 @@ def create_app(
     @app.post("/admin/volumes/{volume_id}/compact", response_model=CompactResult)
     async def compact(volume_id: int) -> CompactResult:
         compactor_fn: Callable[[str, str, int], None] = app.state.compactor
+        volumes_dir = cfg.volumes_dir.strip()
+        if not volumes_dir:
+            raise HTTPException(status_code=500, detail="HAYSTACK_VOLUMES_DIR is not configured")
         try:
-            await run_in_threadpool(compactor_fn, cfg.gateway_base_url, cfg.volumes_dir, volume_id)
+            await run_in_threadpool(compactor_fn, cfg.gateway_base_url, volumes_dir, volume_id)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except httpx.HTTPStatusError as exc:
-            raise HTTPException(status_code=502, detail=f"Compaction failed: {exc.response.status_code}") from exc
+            _LOGGER.exception("Compaction failed due to gateway API error")
+            raise HTTPException(
+                status_code=502,
+                detail="Compaction failed while updating object metadata via gateway admin API",
+            )
         except subprocess.CalledProcessError as exc:
-            stderr = exc.stderr.strip() if exc.stderr else str(exc)
-            raise HTTPException(status_code=502, detail=f"Compaction failed: {stderr}") from exc
+            _LOGGER.exception("Compaction subprocess execution failed")
+            raise HTTPException(status_code=502, detail="Compaction script execution failed")
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Compaction failed: {exc}") from exc
+            _LOGGER.exception("Unexpected compaction failure")
+            raise HTTPException(status_code=500, detail=f"Compaction failed ({type(exc).__name__})")
         return CompactResult(volume_id=volume_id, status="done")
 
     return app

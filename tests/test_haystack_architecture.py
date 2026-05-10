@@ -146,7 +146,7 @@ async def test_object_info_and_system_health_endpoints(tmp_path: Path) -> None:
     async def fetch_from_haystack(volume_id: int, offset: int, size: int) -> bytes:
         return haystack_app.state.manager.read(volume_id, offset, size)
 
-    async def fake_system_health():
+    async def mock_system_health_checker():
         return {
             "gateway": {"status": "ok", "http_status": 200, "error": None},
             "broker": {"status": "ok", "http_status": 200, "error": None},
@@ -160,7 +160,7 @@ async def test_object_info_and_system_health_endpoints(tmp_path: Path) -> None:
         ),
         broker=broker,
         haystack_fetcher=fetch_from_haystack,
-        system_health_checker=fake_system_health,
+        system_health_checker=mock_system_health_checker,
     )
     transport = httpx.ASGITransport(app=gateway_app)
 
@@ -201,12 +201,12 @@ async def test_object_info_and_system_health_endpoints(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_compact_endpoint_calls_compactor(tmp_path: Path) -> None:
     broker = InMemoryBroker()
-    called: dict[str, object] = {}
+    compactor_call_args: dict[str, object] = {}
 
     def fake_compactor(gateway_base_url: str, volumes_dir: str, volume_id: int) -> None:
-        called["gateway_base_url"] = gateway_base_url
-        called["volumes_dir"] = volumes_dir
-        called["volume_id"] = volume_id
+        compactor_call_args["gateway_base_url"] = gateway_base_url
+        compactor_call_args["volumes_dir"] = volumes_dir
+        compactor_call_args["volume_id"] = volume_id
 
     gateway_app = create_gateway_app(
         settings=GatewaySettings(
@@ -225,7 +225,7 @@ async def test_compact_endpoint_calls_compactor(tmp_path: Path) -> None:
             assert response.status_code == 200
             assert response.json() == {"volume_id": 3, "status": "done"}
 
-    assert called == {
+    assert compactor_call_args == {
         "gateway_base_url": "http://gateway:8000",
         "volumes_dir": str(tmp_path / "volumes"),
         "volume_id": 3,
