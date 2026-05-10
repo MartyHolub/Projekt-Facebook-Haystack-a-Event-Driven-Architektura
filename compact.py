@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 from pathlib import Path
 
@@ -20,8 +21,9 @@ def compact_volume(*, gateway_base_url: str, volumes_dir: str, volume_id: int) -
     backup = volumes_path / f"volume_{volume_id}.bak"
 
     try:
-        lock_fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-    except FileExistsError as exc:
+        lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
         raise RuntimeError(f"Compaction for volume {volume_id} is already in progress") from exc
 
     if target.exists():
@@ -61,6 +63,7 @@ def compact_volume(*, gateway_base_url: str, volumes_dir: str, volume_id: int) -
         raise
     finally:
         if lock_fd is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
         lock_file.unlink(missing_ok=True)
 

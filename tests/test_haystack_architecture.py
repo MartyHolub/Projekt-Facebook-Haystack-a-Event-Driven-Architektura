@@ -12,6 +12,9 @@ from cloud.haystack_node.app import VolumeManager, create_app as create_haystack
 from cloud.s3_gateway.app import GatewayDB
 from cloud.s3_gateway.app import create_app as create_gateway_app
 
+_MAX_ACK_RETRIES = 20
+_ACK_RETRY_DELAY_SECONDS = 0.05
+
 
 @pytest.mark.asyncio
 async def test_inmemory_broker_publish_and_stream() -> None:
@@ -106,11 +109,11 @@ async def test_upload_ack_download_and_soft_delete_flow(tmp_path: Path) -> None:
                 assert upload.status_code == 202
                 object_id = upload.json()["object_id"]
 
-                for _ in range(20):
+                for _ in range(_MAX_ACK_RETRIES):
                     row = gateway_app.state.db.get_object(object_id)
                     if row and row["status"] == "ready":
                         break
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(_ACK_RETRY_DELAY_SECONDS)
 
                 row = gateway_app.state.db.get_object(object_id)
                 assert row is not None

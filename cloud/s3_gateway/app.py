@@ -6,6 +6,7 @@ from contextlib import suppress
 from datetime import datetime, timezone
 import os
 import sqlite3
+import threading
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
@@ -31,6 +32,7 @@ def _utcnow() -> str:
 class GatewayDB:
     def __init__(self, path: str) -> None:
         self.path = path
+        self._lock = threading.Lock()
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -39,55 +41,71 @@ class GatewayDB:
         self._init_schema()
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
     def _init_schema(self) -> None:
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS objects (
-                object_id TEXT PRIMARY KEY,
-                bucket TEXT NOT NULL,
-                owner TEXT NOT NULL,
-                status TEXT NOT NULL,
-                volume_id INTEGER,
-                offset INTEGER,
-                size INTEGER,
-                content_type TEXT,
-                is_deleted INTEGER NOT NULL DEFAULT 0,
-                billed INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+        with self._lock:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS objects (
+                    object_id TEXT PRIMARY KEY,
+                    bucket TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    volume_id INTEGER,
+                    offset INTEGER,
+                    size INTEGER,
+                    content_type TEXT,
+                    is_deleted INTEGER NOT NULL DEFAULT 0,
+                    billed INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
-        self.conn.commit()
+            self.conn.commit()
 
     def create_uploading_object(self, *, object_id: str, bucket: str, owner: str, content_type: str | None) -> None:
         now = _utcnow()
-        self.conn.execute(
-            """
-            INSERT INTO objects (object_id, bucket, owner, status, content_type, created_at, updated_at)
-            VALUES (?, ?, ?, 'uploading', ?, ?, ?)
-            """,
-            (object_id, bucket, owner, content_type, now, now),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO objects (object_id, bucket, owner, status, content_type, created_at, updated_at)
+                VALUES (?, ?, ?, 'uploading', ?, ?, ?)
+                """,
+                (object_id, bucket, owner, content_type, now, now),
+            )
+            self.conn.commit()
 
     def mark_ready(self, *, object_id: str, volume_id: int, offset: int, size: int) -> bool:
-        row = self.conn.execute(
-            "SELECT status, billed FROM objects WHERE object_id = ?",
-            (object_id,),
-        ).fetchone()
-        if row is None:
-            return False
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT status, volume_id, offset, size FROM objects WHERE object_id = ?",
+                (object_id,),
+            ).fetchone()
+            if row is None:
+                return False
 
-        now = _utcnow()
-        if row["status"] == "ready":
-            # idempotent ACK handling
+            now = _utcnow()
+            if row["status"] == "ready":
+                if (
+                    row["volume_id"] != volume_id
+                    or row["offset"] != offset
+                    or row["size"] != size
+                ):
+                    return False
+                self.conn.execute(
+                    "UPDATE objects SET updated_at = ? WHERE object_id = ?",
+                    (now, object_id),
+                )
+                self.conn.commit()
+                return True
+
             self.conn.execute(
                 """
                 UPDATE objects
-                SET volume_id = ?, offset = ?, size = ?, updated_at = ?
+                SET status = 'ready', volume_id = ?, offset = ?, size = ?, billed = 1, updated_at = ?
                 WHERE object_id = ?
                 """,
                 (volume_id, offset, size, now, object_id),
@@ -95,60 +113,59 @@ class GatewayDB:
             self.conn.commit()
             return True
 
-        self.conn.execute(
-            """
-            UPDATE objects
-            SET status = 'ready', volume_id = ?, offset = ?, size = ?, billed = 1, updated_at = ?
-            WHERE object_id = ?
-            """,
-            (volume_id, offset, size, now, object_id),
-        )
-        self.conn.commit()
-        return True
-
     def get_object(self, object_id: str) -> sqlite3.Row | None:
-        return self.conn.execute(
-            "SELECT * FROM objects WHERE object_id = ?",
-            (object_id,),
-        ).fetchone()
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM objects WHERE object_id = ?",
+                (object_id,),
+            ).fetchone()
 
     def soft_delete(self, object_id: str) -> bool:
-        row = self.get_object(object_id)
-        if row is None:
-            return False
-        self.conn.execute(
-            "UPDATE objects SET is_deleted = 1, updated_at = ? WHERE object_id = ?",
-            (_utcnow(), object_id),
-        )
-        self.conn.commit()
-        return True
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT object_id FROM objects WHERE object_id = ?",
+                (object_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            self.conn.execute(
+                "UPDATE objects SET is_deleted = 1, updated_at = ? WHERE object_id = ?",
+                (_utcnow(), object_id),
+            )
+            self.conn.commit()
+            return True
 
     def list_live_objects_for_volume(self, volume_id: int) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            """
-            SELECT object_id, volume_id, offset, size
-            FROM objects
-            WHERE status = 'ready' AND is_deleted = 0 AND volume_id = ?
-            ORDER BY offset ASC
-            """,
-            (volume_id,),
-        ).fetchall()
-        return [dict(row) for row in rows]
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT object_id, volume_id, offset, size
+                FROM objects
+                WHERE status = 'ready' AND is_deleted = 0 AND volume_id = ?
+                ORDER BY offset ASC
+                """,
+                (volume_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def update_location(self, *, object_id: str, volume_id: int, offset: int, size: int) -> bool:
-        row = self.get_object(object_id)
-        if row is None:
-            return False
-        self.conn.execute(
-            """
-            UPDATE objects
-            SET volume_id = ?, offset = ?, size = ?, updated_at = ?
-            WHERE object_id = ?
-            """,
-            (volume_id, offset, size, _utcnow(), object_id),
-        )
-        self.conn.commit()
-        return True
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT object_id FROM objects WHERE object_id = ?",
+                (object_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            self.conn.execute(
+                """
+                UPDATE objects
+                SET volume_id = ?, offset = ?, size = ?, updated_at = ?
+                WHERE object_id = ?
+                """,
+                (volume_id, offset, size, _utcnow(), object_id),
+            )
+            self.conn.commit()
+            return True
 
 
 class UploadAccepted(BaseModel):
